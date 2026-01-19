@@ -97,16 +97,33 @@ else:
 CONNECTION_STRING = f"postgresql+psycopg2://{connection_suffix}"
 DSN = f"postgresql://{connection_suffix}"
 
-## Directory Security Configuration
-# Comma-separated list of allowed base directories for local file operations.
-# If not set, local directory operations are DISABLED for security.
-# Example: RAG_ALLOWED_LOCAL_PATHS="/data/documents,/home/user/files"
-_allowed_paths_env = get_env_variable("RAG_ALLOWED_LOCAL_PATHS", "")
-ALLOWED_LOCAL_PATHS: list[str] = [
-    os.path.realpath(p.strip())
-    for p in _allowed_paths_env.split(",")
-    if p.strip()
-]
+## Directory Watch Configuration
+# Auto-configure directory watches on startup.
+# Format: path:watch_id,path:watch_id (watch_id used for grouping/querying files)
+# Example: RAG_WATCH_DIRECTORIES="/app/documents/governance:governance,/app/documents/finance:finance"
+# Paths from this config are automatically allowed for local file operations.
+_watch_dirs_env = get_env_variable("RAG_WATCH_DIRECTORIES", "")
+WATCH_DIRECTORIES: list[dict] = []
+for entry in _watch_dirs_env.split(","):
+    entry = entry.strip()
+    if not entry:
+        continue
+    if ":" in entry:
+        path, watch_id = entry.rsplit(":", 1)
+        WATCH_DIRECTORIES.append({
+            "path": os.path.realpath(path.strip()),
+            "watch_id": watch_id.strip(),
+        })
+    else:
+        # If no watch_id provided, use directory name
+        path = entry
+        WATCH_DIRECTORIES.append({
+            "path": os.path.realpath(path.strip()),
+            "watch_id": os.path.basename(path.strip()),
+        })
+
+# Allowed paths derived from watch directories
+ALLOWED_LOCAL_PATHS: list[str] = [wd["path"] for wd in WATCH_DIRECTORIES]
 
 # Maximum number of directory watches per entity (0 = unlimited)
 MAX_WATCHES_PER_ENTITY = int(get_env_variable("RAG_MAX_WATCHES_PER_ENTITY", "10"))

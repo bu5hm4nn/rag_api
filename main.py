@@ -21,6 +21,7 @@ from app.config import (
     CHUNK_OVERLAP,
     PDF_EXTRACT_IMAGES,
     VECTOR_DB_TYPE,
+    WATCH_DIRECTORIES,
     LogMiddleware,
     logger,
 )
@@ -30,6 +31,7 @@ from app.services.database import PSQLDatabase, ensure_vector_indexes
 from app.services.directory_service import (
     ensure_directory_tables,
     get_all_enabled_watches,
+    save_watch_to_db,
     sync_single_file,
     update_watch_last_sync,
 )
@@ -103,6 +105,37 @@ async def lifespan(app: FastAPI):
 
         watch_manager.initialize(loop, on_changes)
         watch_manager.start()
+
+        # Auto-configure watches from RAG_WATCH_DIRECTORIES environment variable
+        # This ensures watches are persisted to database on first startup
+        if WATCH_DIRECTORIES:
+            logger.info(
+                f"Auto-configuring {len(WATCH_DIRECTORIES)} watches from RAG_WATCH_DIRECTORIES"
+            )
+            for watch_config in WATCH_DIRECTORIES:
+                dir_path = watch_config["path"]
+                watch_id = watch_config["watch_id"]
+                if os.path.isdir(dir_path):
+                    # Create watch object and save to database (upsert)
+                    watch = DirectoryWatch(
+                        watch_id=0,  # Will be assigned by database
+                        directory_path=dir_path,
+                        entity_id=watch_id,
+                        recursive=True,
+                        extensions=None,
+                        ignore_patterns=[".git", "__pycache__", "node_modules", ".DS_Store"],
+                        debounce_seconds=10,
+                        enabled=True,
+                    )
+                    try:
+                        await save_watch_to_db(watch)
+                        logger.info(f"Auto-configured watch: {dir_path} -> {watch_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-configure watch {dir_path}: {e}")
+                else:
+                    logger.warning(
+                        f"Skipping auto-configure: directory {dir_path} does not exist"
+                    )
 
         # Restore persisted watches from database
         try:
