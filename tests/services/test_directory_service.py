@@ -243,6 +243,47 @@ class TestIndexedFileCRUD:
         assert len(result) == 2
         assert result[0]["filepath"] == "/dir/file1.txt"
 
+    @pytest.mark.asyncio
+    async def test_get_indexed_files_by_entity(self):
+        """Get all indexed files for an entity."""
+        from datetime import datetime, timezone
+
+        mock_rows = [
+            {
+                "file_id": "id1",
+                "filepath": "/dir1/file1.txt",
+                "entity_id": "user123",
+                "indexed_at": datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+            },
+            {
+                "file_id": "id2",
+                "filepath": "/dir2/file2.txt",
+                "entity_id": "user123",
+                "indexed_at": datetime(2024, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
+            },
+        ]
+
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = mock_rows
+        mock_pool = create_mock_pool(mock_conn)
+
+        with patch(
+            "app.services.directory_service.PSQLDatabase.get_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ):
+            from app.services.directory_service import get_indexed_files_by_entity
+
+            result = await get_indexed_files_by_entity("user123")
+
+        assert len(result) == 2
+        assert result[0]["file_id"] == "id1"
+        assert result[0]["entity_id"] == "user123"
+        # Verify query filters by entity_id and status
+        call_args = str(mock_conn.fetch.call_args)
+        assert "entity_id" in call_args
+        assert "indexed" in call_args.lower() or "status" in call_args
+
 
 class TestWatchCRUD:
     """Tests for watched_directories CRUD operations."""

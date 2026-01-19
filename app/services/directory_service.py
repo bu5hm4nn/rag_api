@@ -252,6 +252,30 @@ async def get_indexed_files_in_directory(directory: str, entity_id: str) -> List
         return [dict(row) for row in rows]
 
 
+async def get_indexed_files_by_entity(entity_id: str) -> List[dict]:
+    """
+    Get all indexed files for an entity.
+
+    Args:
+        entity_id: User/entity identifier
+
+    Returns:
+        List of file records with file_id, filepath, entity_id, indexed_at
+    """
+    pool = await PSQLDatabase.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT file_id, filepath, entity_id, indexed_at
+            FROM indexed_files
+            WHERE entity_id = $1 AND status = 'indexed'
+            ORDER BY filepath
+            """,
+            entity_id,
+        )
+        return [dict(row) for row in rows]
+
+
 # --- Watched Directories CRUD ---
 
 
