@@ -98,6 +98,29 @@ else:
 CONNECTION_STRING = f"postgresql+psycopg2://{connection_suffix}"
 DSN = f"postgresql://{connection_suffix}"
 
+## Directory Security Configuration
+# Comma-separated list of allowed base directories for local file operations.
+# If not set, local directory operations are DISABLED for security.
+# Example: RAG_ALLOWED_LOCAL_PATHS="/data/documents,/home/user/files"
+_allowed_paths_env = get_env_variable("RAG_ALLOWED_LOCAL_PATHS", "")
+ALLOWED_LOCAL_PATHS: list[str] = [
+    os.path.realpath(p.strip())
+    for p in _allowed_paths_env.split(",")
+    if p.strip()
+]
+
+# Maximum number of directory watches per entity (0 = unlimited)
+MAX_WATCHES_PER_ENTITY = int(get_env_variable("RAG_MAX_WATCHES_PER_ENTITY", "10"))
+
+# Maximum number of files to process in a single directory operation
+MAX_FILES_PER_OPERATION = int(get_env_variable("RAG_MAX_FILES_PER_OPERATION", "10000"))
+
+# Maximum pending file changes per watch before dropping oldest
+MAX_PENDING_CHANGES_PER_WATCH = int(get_env_variable("RAG_MAX_PENDING_CHANGES", "1000"))
+
+# Whether to follow symbolic links (SECURITY: default False)
+FOLLOW_SYMLINKS = get_env_variable("RAG_FOLLOW_SYMLINKS", "False").lower() == "true"
+
 ## Logging
 
 HTTP_RES = "http_res"

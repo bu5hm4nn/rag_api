@@ -1,5 +1,8 @@
 # main.py
+import asyncio
 import os
+from typing import List
+
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -23,9 +26,49 @@ from app.config import (
     vector_store,
 )
 from app.middleware import security_middleware
-from app.routes import document_routes, pgvector_routes
+from app.routes import document_routes, pgvector_routes, directory_routes
 from app.services.database import PSQLDatabase, ensure_vector_indexes
 from app.services.vector_store.factory import close_vector_store_connections
+from app.services.directory_service import (
+    ensure_directory_tables,
+    get_all_enabled_watches,
+    sync_single_file,
+    update_watch_last_sync,
+)
+from app.utils.directory_watcher import (
+    DirectoryWatch,
+    DirectoryWatchManager,
+    PendingChange,
+)
+
+
+async def handle_file_changes(
+    watch: DirectoryWatch, changes: List[PendingChange], executor
+):
+    """
+    Callback for processing file changes from the watch manager.
+    This runs in the main async event loop.
+    """
+    for change in changes:
+        try:
+            if change.event_type == "deleted":
+                await sync_single_file(
+                    filepath=change.filepath,
+                    entity_id=watch.entity_id,
+                    executor=executor,
+                    delete_if_missing=True,
+                )
+            else:
+                await sync_single_file(
+                    filepath=change.filepath,
+                    entity_id=watch.entity_id,
+                    executor=executor,
+                    delete_if_missing=False,
+                )
+        except Exception as e:
+            logger.error(f"Failed to process change for {change.filepath}: {e}")
+
+    await update_watch_last_sync(watch.watch_id)
 
 
 @asynccontextmanager
@@ -42,13 +85,58 @@ async def lifespan(app: FastAPI):
         f"Initialized thread pool with {max_workers} workers (CPU cores: {os.cpu_count()})"
     )
 
+    watch_manager = None
+
     if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
         await PSQLDatabase.get_pool()  # Initialize the pool
         await ensure_vector_indexes()
+        await ensure_directory_tables()
+
+        # Initialize and start directory watch manager
+        loop = asyncio.get_running_loop()
+        watch_manager = DirectoryWatchManager()
+
+        # Create a callback that captures the executor
+        async def on_changes(watch: DirectoryWatch, changes: List[PendingChange]):
+            await handle_file_changes(watch, changes, app.state.thread_pool)
+
+        watch_manager.initialize(loop, on_changes)
+        watch_manager.start()
+
+        # Restore persisted watches from database
+        try:
+            enabled_watches = await get_all_enabled_watches()
+            for watch_data in enabled_watches:
+                # Only restore if directory still exists
+                if os.path.isdir(watch_data["directory_path"]):
+                    watch = DirectoryWatch(
+                        watch_id=watch_data["id"],
+                        directory_path=watch_data["directory_path"],
+                        entity_id=watch_data["entity_id"],
+                        recursive=watch_data["recursive"],
+                        extensions=watch_data.get("file_extensions"),
+                        ignore_patterns=watch_data.get("ignore_patterns") or [],
+                        debounce_seconds=watch_data.get("debounce_seconds", 5),
+                        enabled=True,
+                    )
+                    watch_manager.add_watch(watch)
+                else:
+                    logger.warning(
+                        f"Skipping watch {watch_data['id']}: "
+                        f"directory {watch_data['directory_path']} no longer exists"
+                    )
+
+            logger.info(f"Restored {len(watch_manager.get_all_watches())} directory watches")
+        except Exception as e:
+            logger.error(f"Failed to restore directory watches: {e}")
 
     yield
 
     # Cleanup logic
+    if watch_manager:
+        logger.info("Stopping directory watch manager")
+        watch_manager.stop()
+
     if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
         try:
             logger.info("Closing asyncpg connection pool")
@@ -57,7 +145,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Failed to close asyncpg pool: %s", e)
 
-    # Drain in-flight work before closing backing resources
     logger.info("Shutting down thread pool")
     app.state.thread_pool.shutdown(wait=True)
     logger.info("Thread pool shutdown complete")
@@ -90,6 +177,7 @@ app.state.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
 
 # Include routers
 app.include_router(document_routes.router)
+app.include_router(directory_routes.router)
 if debug_mode:
     app.include_router(router=pgvector_routes.router)
 
