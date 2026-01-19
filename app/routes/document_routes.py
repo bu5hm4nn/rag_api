@@ -1065,3 +1065,39 @@ async def extract_text_from_file(
             )
     finally:
         await cleanup_temp_file_async(temp_file_path)
+
+
+@router.get("/entity/{entity_id}/files")
+async def get_entity_files(request: Request, entity_id: str):
+    """
+    List all indexed files for an entity.
+
+    Returns file metadata for all files indexed under the given entity_id.
+
+    Security: When authenticated via JWT, users can only access their own files.
+    """
+    from app.services.directory_service import get_indexed_files_by_entity
+
+    # Security: Enforce authorization - authenticated users can only see their own files
+    if hasattr(request.state, "user") and request.state.user:
+        authenticated_id = request.state.user.get("id")
+        if authenticated_id and entity_id != authenticated_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    files = await get_indexed_files_by_entity(entity_id)
+    return {
+        "entity_id": entity_id,
+        "file_count": len(files),
+        "files": [
+            {
+                "file_id": f["file_id"],
+                "filepath": f["filepath"],
+                "filename": os.path.basename(f["filepath"]),
+                "indexed_at": f["indexed_at"].isoformat() if f.get("indexed_at") else None,
+            }
+            for f in files
+        ],
+    }
