@@ -1154,6 +1154,9 @@ async def get_entity_files(request: Request, entity_id: str):
                 "filepath": f["filepath"],
                 "filename": os.path.basename(f["filepath"]),
                 "indexed_at": f["indexed_at"].isoformat() if f.get("indexed_at") else None,
+                "file_mtime": f["file_mtime"].isoformat() if f.get("file_mtime") else None,
+                "file_size": f["file_size"],
+                "updated_at": f["updated_at"].isoformat() if f.get("updated_at") else None,
             }
             for f in files
         ],

@@ -254,12 +254,18 @@ class TestIndexedFileCRUD:
                 "filepath": "/dir1/file1.txt",
                 "entity_id": "user123",
                 "indexed_at": datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+                "file_mtime": datetime(2024, 1, 10, 8, 0, 0, tzinfo=timezone.utc),
+                "file_size": 1024,
+                "updated_at": datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
             },
             {
                 "file_id": "id2",
                 "filepath": "/dir2/file2.txt",
                 "entity_id": "user123",
                 "indexed_at": datetime(2024, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
+                "file_mtime": datetime(2024, 1, 12, 14, 22, 0, tzinfo=timezone.utc),
+                "file_size": 2048,
+                "updated_at": datetime(2024, 1, 15, 11, 0, 0, tzinfo=timezone.utc),
             },
         ]
 
@@ -279,6 +285,11 @@ class TestIndexedFileCRUD:
         assert len(result) == 2
         assert result[0]["file_id"] == "id1"
         assert result[0]["entity_id"] == "user123"
+        # Verify new metadata fields are returned
+        assert result[0]["file_mtime"] == datetime(2024, 1, 10, 8, 0, 0, tzinfo=timezone.utc)
+        assert result[0]["file_size"] == 1024
+        assert result[0]["updated_at"] == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+        assert result[1]["file_size"] == 2048
         # Verify query filters by entity_id and status
         call_args = str(mock_conn.fetch.call_args)
         assert "entity_id" in call_args

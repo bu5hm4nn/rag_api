@@ -260,13 +260,15 @@ async def get_indexed_files_by_entity(entity_id: str) -> List[dict]:
         entity_id: User/entity identifier
 
     Returns:
-        List of file records with file_id, filepath, entity_id, indexed_at
+        List of file records with file_id, filepath, entity_id, indexed_at,
+        file_mtime, file_size, updated_at
     """
     pool = await PSQLDatabase.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT file_id, filepath, entity_id, indexed_at
+            SELECT file_id, filepath, entity_id, indexed_at,
+                   file_mtime, file_size, updated_at
             FROM indexed_files
             WHERE entity_id = $1 AND status = 'indexed'
             ORDER BY filepath
