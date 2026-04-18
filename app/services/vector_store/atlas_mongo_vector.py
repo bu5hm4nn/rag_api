@@ -24,7 +24,7 @@ class AtlasMongoVector(MongoDBAtlasVectorSearch):
             return []
         file_id = documents[0].metadata["file_id"]
         f_ids = [
-            f"{file_id}_{doc.metadata.get('digest') or hashlib.md5(doc.page_content.encode()).hexdigest()}"
+            f"{file_id}_{doc.metadata.get('digest') or hashlib.md5(doc.page_content.encode('utf-8', 'ignore')).hexdigest()}"
             for doc in documents
         ]
         return super().add_documents(documents, f_ids)

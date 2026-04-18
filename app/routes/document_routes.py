@@ -419,6 +419,7 @@ async def _process_documents_async_pipeline(
     embedding_queue = asyncio.Queue(maxsize=EMBEDDING_MAX_QUEUE_SIZE)
     results_queue = asyncio.Queue()
     all_ids = []
+    inserted_any = False
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
 
@@ -459,6 +460,7 @@ async def _process_documents_async_pipeline(
 
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
+        nonlocal inserted_any
         try:
             while True:
                 item = await embedding_queue.get()
@@ -480,7 +482,9 @@ async def _process_documents_async_pipeline(
                     batch_result_ids = await vector_store.aadd_documents(
                         batch_documents, ids=batch_ids, executor=executor
                     )
-                    await results_queue.put(batch_result_ids)
+                    all_ids.extend(batch_result_ids)
+                    inserted_any = True
+                    await results_queue.put(None)
                 except Exception as e:
                     logger.error(
                         "Error processing batch %d/%d: %s", batch_num, total_batches, e
@@ -505,12 +509,11 @@ async def _process_documents_async_pipeline(
         # Wait for both to complete
         await asyncio.gather(producer_task, consumer_task, return_exceptions=False)
 
-        # Collect results from all batches
+        # Collect per-batch completion/error signals
         for _ in range(num_batches):
             result = await results_queue.get()
             if isinstance(result, Exception):
                 raise result
-            all_ids.extend(result)
 
         logger.info(
             "Async pipeline completed for file %s: %d embeddings created",
@@ -539,8 +542,9 @@ async def _process_documents_async_pipeline(
                     consumer_task, producer_task, return_exceptions=True
                 )
 
-        # Attempt rollback only if we inserted something
-        if all_ids:
+        # Attempt rollback if any batch insert succeeded, even if a later failure
+        # happened before the results queue was fully drained.
+        if inserted_any or all_ids:
             try:
                 logger.warning("Performing rollback of file %s", file_id)
                 await vector_store.delete(ids=[file_id], executor=executor)
