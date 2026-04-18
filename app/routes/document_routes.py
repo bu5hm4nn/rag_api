@@ -1,11 +1,13 @@
 # app/routes/document_routes.py
 import os
+import uuid
+from pathlib import Path
 import hashlib
 import traceback
 import aiofiles
 import aiofiles.os
 from shutil import copyfileobj
-from typing import List, Iterable, TYPE_CHECKING
+from typing import List, Iterable, Optional, Union, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import (
     APIRouter,
@@ -19,13 +21,13 @@ from fastapi import (
     status,
 )
 from langchain_core.documents import Document
-from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
+    from app.services.vector_store.atlas_mongo_vector import AtlasMongoVector
     from langchain_community.vectorstores.pgvector import PGVector as PgVector
 
 from app.config import (
@@ -109,17 +111,47 @@ def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
         )
 
 
+def validate_file_path(base_dir: str, file_path: str) -> Optional[str]:
+    """Validate that file_path resolves within base_dir. Returns resolved absolute path or None."""
+    if not file_path or not file_path.strip():
+        return None
+    try:
+        allowed = Path(base_dir).resolve()
+        requested = Path(os.path.join(base_dir, file_path)).resolve()
+        requested.relative_to(allowed)
+        return str(requested)
+    except (ValueError, RuntimeError, TypeError, OSError):
+        return None
+
+
+def _make_unique_temp_path(user_id: str, filename: str) -> Optional[str]:
+    """Build a unique temp file path under RAG_UPLOAD_DIR/{user_id}/ to prevent
+    concurrent upload collisions. Returns a validated absolute path, or None if
+    the raw filename would escape RAG_UPLOAD_DIR (path traversal rejection)."""
+    # Validate the raw filename to reject traversal attempts
+    if validate_file_path(RAG_UPLOAD_DIR, os.path.join(user_id, filename)) is None:
+        return None
+    # unique_name is stem + "_" + [0-9a-f]{32} + suffix — no path separators,
+    # so it cannot escape the directory validated above.
+    p = Path(filename)
+    unique_name = f"{p.stem}_{uuid.uuid4().hex}{p.suffix}"
+    return str(Path(RAG_UPLOAD_DIR, user_id, unique_name).resolve())
+
+
 async def load_file_content(
     filename: str, content_type: str, file_path: str, executor
 ) -> tuple:
     """Load file content using appropriate loader."""
-    loader, known_type, file_ext = get_loader(filename, content_type, file_path)
-    data = await run_in_executor(executor, loader.load)
-
-    # Clean up temporary UTF-8 file if it was created for encoding conversion
-    cleanup_temp_encoding_file(loader)
-
-    return data, known_type, file_ext
+    loader = None
+    try:
+        loader, known_type, file_ext = get_loader(filename, content_type, file_path)
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(executor, lambda: list(loader.lazy_load()))
+        return data, known_type, file_ext
+    finally:
+        # Clean up temporary UTF-8 file if it was created for encoding conversion
+        if loader is not None:
+            cleanup_temp_encoding_file(loader)
 
 
 def extract_text_from_documents(documents: List[Document], file_ext: str) -> str:
@@ -300,12 +332,12 @@ async def query_embeddings_by_file_id(
             documents = await vector_store.asimilarity_search_with_score_by_vector(
                 embedding,
                 k=body.k,
-                filter={"file_id": body.file_id},
+                filter={"file_id": {"$eq": body.file_id}},
                 executor=request.app.state.thread_pool,
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": body.file_id}
+                embedding, k=body.k, filter={"file_id": {"$eq": body.file_id}}
             )
 
         if not documents:
@@ -379,10 +411,15 @@ async def _process_documents_async_pipeline(
     if total_chunks == 0:
         return []
 
-    # Create a queue for producer-consumer pattern
+    # Create queues for producer-consumer pattern
+    # embedding_queue is bounded to limit document data held in memory.
+    # results_queue is unbounded — it holds only small UUID lists, and the
+    # drain loop runs after gather(), so bounding it would deadlock when
+    # num_batches > maxsize.
     embedding_queue = asyncio.Queue(maxsize=EMBEDDING_MAX_QUEUE_SIZE)
     results_queue = asyncio.Queue()
     all_ids = []
+    inserted_any = False
 
     num_batches = calculate_num_batches(total_chunks, EMBEDDING_BATCH_SIZE)
 
@@ -423,6 +460,7 @@ async def _process_documents_async_pipeline(
 
     async def embedding_consumer():
         """Consume batches from queue, embed and insert into database."""
+        nonlocal inserted_any
         try:
             while True:
                 item = await embedding_queue.get()
@@ -444,7 +482,9 @@ async def _process_documents_async_pipeline(
                     batch_result_ids = await vector_store.aadd_documents(
                         batch_documents, ids=batch_ids, executor=executor
                     )
-                    await results_queue.put(batch_result_ids)
+                    all_ids.extend(batch_result_ids)
+                    inserted_any = True
+                    await results_queue.put(None)
                 except Exception as e:
                     logger.error(
                         "Error processing batch %d/%d: %s", batch_num, total_batches, e
@@ -469,12 +509,11 @@ async def _process_documents_async_pipeline(
         # Wait for both to complete
         await asyncio.gather(producer_task, consumer_task, return_exceptions=False)
 
-        # Collect results from all batches
+        # Collect per-batch completion/error signals
         for _ in range(num_batches):
             result = await results_queue.get()
             if isinstance(result, Exception):
                 raise result
-            all_ids.extend(result)
 
         logger.info(
             "Async pipeline completed for file %s: %d embeddings created",
@@ -503,8 +542,9 @@ async def _process_documents_async_pipeline(
                     consumer_task, producer_task, return_exceptions=True
                 )
 
-        # Attempt rollback only if we inserted something
-        if all_ids:
+        # Attempt rollback if any batch insert succeeded, even if a later failure
+        # happened before the results queue was fully drained.
+        if inserted_any or all_ids:
             try:
                 logger.warning("Performing rollback of file %s", file_id)
                 await vector_store.delete(ids=[file_id], executor=executor)
@@ -519,7 +559,7 @@ async def _process_documents_async_pipeline(
 async def _process_documents_batched_sync(
     documents: List[Document],
     file_id: str,
-    vector_store: "PgVector",
+    vector_store: Union["PgVector", "AtlasMongoVector"],
     executor: "ThreadPoolExecutor",
 ) -> List[str]:
     """
@@ -528,7 +568,7 @@ async def _process_documents_batched_sync(
     Args:
         documents: List of Document objects to process
         file_id: Unique identifier for the file being processed
-        vector_store: Synchronous PgVector instance for document storage
+        vector_store: Synchronous vector store instance (ExtendedPgVector or AtlasMongoVector)
         executor: ThreadPoolExecutor for running sync operations
 
     Returns:
@@ -570,7 +610,7 @@ async def _process_documents_batched_sync(
             batch_result_ids = await loop.run_in_executor(
                 executor,
                 lambda docs=batch_documents, ids=batch_ids: vector_store.add_documents(
-                    documents=docs, ids=ids
+                    docs, ids=ids
                 ),
             )
             all_ids.extend(batch_result_ids)
@@ -598,14 +638,8 @@ async def _process_documents_batched_sync(
     return all_ids
 
 
-def generate_digest(page_content: str):
-    try:
-        hash_obj = hashlib.md5(page_content.encode("utf-8"))
-    except UnicodeEncodeError:
-        hash_obj = hashlib.md5(
-            page_content.encode("utf-8", "ignore").decode("utf-8").encode("utf-8")
-        )
-    return hash_obj.hexdigest()
+def generate_digest(page_content: str) -> str:
+    return hashlib.md5(page_content.encode("utf-8", "ignore")).hexdigest()
 
 
 def _prepare_documents_sync(
@@ -702,8 +736,11 @@ async def store_data_in_vector_db(
 async def embed_local_file(
     document: StoreDocument, request: Request, entity_id: str = None
 ):
-    # Check if the file exists
-    if not os.path.exists(document.filepath):
+    file_path = validate_file_path(RAG_UPLOAD_DIR, document.filepath)
+
+    # Check if the file exists and if it is within the allowed upload directory
+    if file_path is None or not os.path.exists(file_path):
+        logger.warning("Path validation failed for local embed: %s", document.filepath)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.FILE_NOT_FOUND,
@@ -714,14 +751,15 @@ async def embed_local_file(
     else:
         user_id = entity_id if entity_id else request.state.user.get("id")
 
+    loader = None
     try:
         loader, known_type, file_ext = get_loader(
-            document.filename, document.file_content_type, document.filepath
+            document.filename, document.file_content_type, file_path
         )
-        data = await run_in_executor(request.app.state.thread_pool, loader.load)
-
-        # Clean up temporary UTF-8 file if it was created for encoding conversion
-        cleanup_temp_encoding_file(loader)
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            request.app.state.thread_pool, lambda: list(loader.lazy_load())
+        )
 
         result = await store_data_in_vector_db(
             data,
@@ -762,6 +800,10 @@ async def embed_local_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
+    finally:
+        # Clean up temporary UTF-8 file if it was created for encoding conversion
+        if loader is not None:
+            cleanup_temp_encoding_file(loader)
 
 
 @router.post("/embed")
@@ -776,17 +818,22 @@ async def embed_file(
     known_type = None
 
     user_id = get_user_id(request, entity_id)
-    temp_base_path = os.path.join(RAG_UPLOAD_DIR, user_id)
-    os.makedirs(temp_base_path, exist_ok=True)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, user_id, file.filename)
+    validated_file_path = _make_unique_temp_path(user_id, file.filename)
 
-    await save_upload_file_async(file, temp_file_path)
+    if validated_file_path is None:
+        logger.warning("Path validation failed for embed: %s", file.filename)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+        )
 
     try:
+        os.makedirs(os.path.dirname(validated_file_path), exist_ok=True)
+        await save_upload_file_async(file, validated_file_path)
         data, known_type, file_ext = await load_file_content(
             file.filename,
             file.content_type,
-            temp_file_path,
+            validated_file_path,
             request.app.state.thread_pool,
         )
 
@@ -837,7 +884,7 @@ async def embed_file(
             detail=f"Error during file processing: {str(e)}",
         )
     finally:
-        await cleanup_temp_file_async(temp_file_path)
+        await cleanup_temp_file_async(validated_file_path)
 
     return {
         "status": response_status,
@@ -904,15 +951,25 @@ async def embed_file_upload(
     entity_id: str = Form(None),
 ):
     user_id = get_user_id(request, entity_id)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, uploaded_file.filename)
 
-    await save_upload_file_async(uploaded_file, temp_file_path)
+    validated_temp_file_path = _make_unique_temp_path(user_id, uploaded_file.filename)
+
+    if validated_temp_file_path is None:
+        logger.warning(
+            "Path validation failed for embed-upload: %s", uploaded_file.filename
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+        )
 
     try:
+        os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
+        await save_upload_file_async(uploaded_file, validated_temp_file_path)
         data, known_type, file_ext = await load_file_content(
             uploaded_file.filename,
             uploaded_file.content_type,
-            temp_file_path,
+            validated_temp_file_path,
             request.app.state.thread_pool,
         )
 
@@ -948,7 +1005,7 @@ async def embed_file_upload(
             detail=f"Error during file processing: {str(e)}",
         )
     finally:
-        await cleanup_temp_file_async(temp_file_path)
+        await cleanup_temp_file_async(validated_temp_file_path)
 
     return {
         "status": True,
@@ -1015,17 +1072,22 @@ async def extract_text_from_file(
     Returns the raw text content for text parsing purposes.
     """
     user_id = get_user_id(request, entity_id)
-    temp_base_path = os.path.join(RAG_UPLOAD_DIR, user_id)
-    os.makedirs(temp_base_path, exist_ok=True)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, user_id, file.filename)
+    validated_temp_file_path = _make_unique_temp_path(user_id, file.filename)
 
-    await save_upload_file_async(file, temp_file_path)
+    if validated_temp_file_path is None:
+        logger.warning("Path validation failed for text extraction: %s", file.filename)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
+        )
 
     try:
+        os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
+        await save_upload_file_async(file, validated_temp_file_path)
         data, known_type, file_ext = await load_file_content(
             file.filename,
             file.content_type,
-            temp_file_path,
+            validated_temp_file_path,
             request.app.state.thread_pool,
         )
 
@@ -1064,7 +1126,7 @@ async def extract_text_from_file(
                 detail=f"Error during text extraction: {str(e)}",
             )
     finally:
-        await cleanup_temp_file_async(temp_file_path)
+        await cleanup_temp_file_async(validated_temp_file_path)
 
 
 @router.get("/entity/{entity_id}/files")
@@ -1078,7 +1140,6 @@ async def get_entity_files(request: Request, entity_id: str):
     """
     from app.services.directory_service import get_indexed_files_by_entity
 
-    # Security: Enforce authorization - authenticated users can only see their own files
     if hasattr(request.state, "user") and request.state.user:
         authenticated_id = request.state.user.get("id")
         if authenticated_id and entity_id != authenticated_id:
