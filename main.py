@@ -33,6 +33,7 @@ from app.services.vector_store.factory import close_vector_store_connections
 from app.services.directory_service import (
     ensure_directory_tables,
     get_all_enabled_watches,
+    get_watch_from_db,
     save_watch_to_db,
     sync_single_file,
     update_watch_last_sync,
@@ -73,6 +74,15 @@ async def handle_file_changes(
     await update_watch_last_sync(watch.watch_id)
 
 
+async def ensure_watch_registered(manager: DirectoryWatchManager, watch: DirectoryWatch) -> bool:
+    """Persist a watch and ensure it is active in the runtime manager."""
+    watch.watch_id = await save_watch_to_db(watch)
+    if manager.get_watch(watch.watch_id):
+        return False
+    manager.add_watch(watch)
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic goes here
@@ -105,8 +115,8 @@ async def lifespan(app: FastAPI):
         watch_manager.initialize(loop, on_changes)
         watch_manager.start()
 
-        # Auto-configure watches from RAG_WATCH_DIRECTORIES environment variable
-        # This ensures watches are persisted to database on first startup
+        # Auto-configure watches from RAG_WATCH_DIRECTORIES and ensure they are active.
+        # This is the canonical startup source for project-managed RAG directories.
         if WATCH_DIRECTORIES:
             logger.info(
                 f"Auto-configuring {len(WATCH_DIRECTORIES)} watches from RAG_WATCH_DIRECTORIES"
@@ -114,52 +124,63 @@ async def lifespan(app: FastAPI):
             for watch_config in WATCH_DIRECTORIES:
                 dir_path = watch_config["path"]
                 watch_id = watch_config["watch_id"]
-                if os.path.isdir(dir_path):
-                    # Create watch object and save to database (upsert)
-                    watch = DirectoryWatch(
-                        watch_id=0,  # Will be assigned by database
-                        directory_path=dir_path,
-                        entity_id=watch_id,
-                        recursive=True,
-                        extensions=None,
-                        ignore_patterns=[".git", "__pycache__", "node_modules", ".DS_Store"],
-                        debounce_seconds=10,
-                        enabled=True,
-                    )
-                    try:
-                        await save_watch_to_db(watch)
-                        logger.info(f"Auto-configured watch: {dir_path} -> {watch_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to auto-configure watch {dir_path}: {e}")
-                else:
+                if not os.path.isdir(dir_path):
                     logger.warning(
                         f"Skipping auto-configure: directory {dir_path} does not exist"
                     )
+                    continue
 
-        # Restore persisted watches from database
+                watch = DirectoryWatch(
+                    watch_id=0,
+                    directory_path=dir_path,
+                    entity_id=watch_id,
+                    recursive=True,
+                    extensions=None,
+                    ignore_patterns=[".git", "__pycache__", "node_modules", ".DS_Store"],
+                    debounce_seconds=10,
+                    enabled=True,
+                )
+                try:
+                    created = await ensure_watch_registered(watch_manager, watch)
+                    logger.info(
+                        f"Auto-configured watch: {dir_path} -> {watch_id}"
+                        + (" (activated)" if created else " (already active)")
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to auto-configure watch {dir_path}: {e}")
+
+        # Restore any other persisted watches from database and self-heal missing runtime watches.
         try:
             enabled_watches = await get_all_enabled_watches()
+            restored = 0
             for watch_data in enabled_watches:
-                # Only restore if directory still exists
-                if os.path.isdir(watch_data["directory_path"]):
-                    watch = DirectoryWatch(
-                        watch_id=watch_data["id"],
-                        directory_path=watch_data["directory_path"],
-                        entity_id=watch_data["entity_id"],
-                        recursive=watch_data["recursive"],
-                        extensions=watch_data.get("file_extensions"),
-                        ignore_patterns=watch_data.get("ignore_patterns") or [],
-                        debounce_seconds=watch_data.get("debounce_seconds", 5),
-                        enabled=True,
-                    )
-                    watch_manager.add_watch(watch)
-                else:
+                if not os.path.isdir(watch_data["directory_path"]):
                     logger.warning(
                         f"Skipping watch {watch_data['id']}: "
                         f"directory {watch_data['directory_path']} no longer exists"
                     )
+                    continue
 
-            logger.info(f"Restored {len(watch_manager.get_all_watches())} directory watches")
+                if watch_manager.get_watch(watch_data["id"]):
+                    continue
+
+                watch = DirectoryWatch(
+                    watch_id=watch_data["id"],
+                    directory_path=watch_data["directory_path"],
+                    entity_id=watch_data["entity_id"],
+                    recursive=watch_data["recursive"],
+                    extensions=watch_data.get("file_extensions"),
+                    ignore_patterns=watch_data.get("ignore_patterns") or [],
+                    debounce_seconds=watch_data.get("debounce_seconds", 5),
+                    enabled=True,
+                )
+                watch_manager.add_watch(watch)
+                restored += 1
+
+            logger.info(
+                f"Restored {restored} persisted directory watches; "
+                f"{len(watch_manager.get_all_watches())} active total"
+            )
         except Exception as e:
             logger.error(f"Failed to restore directory watches: {e}")
 
