@@ -54,6 +54,40 @@ from app.routes.document_routes import get_user_id as _get_user_id_base
 router = APIRouter(prefix="/local", tags=["directory"])
 
 
+async def ensure_directory_watch(
+    canonical_path: str,
+    entity_id: str,
+    manager: DirectoryWatchManager,
+    recursive: bool = True,
+    file_extensions=None,
+    ignore_patterns=None,
+    debounce_seconds: int = 10,
+) -> int:
+    """Ensure a directory has both a persisted watch and an active runtime watch."""
+    ignore_patterns = ignore_patterns or [".git", "__pycache__", "node_modules", ".DS_Store"]
+
+    existing = await get_watch_from_db(canonical_path, entity_id)
+    watch = DirectoryWatch(
+        watch_id=existing["id"] if existing else 0,
+        directory_path=canonical_path,
+        entity_id=entity_id,
+        recursive=recursive,
+        extensions=file_extensions,
+        ignore_patterns=ignore_patterns,
+        debounce_seconds=debounce_seconds,
+        enabled=True,
+    )
+    watch.watch_id = await save_watch_to_db(watch)
+
+    if not manager.get_watch(watch.watch_id):
+        manager.add_watch(watch)
+        logger.info(
+            f"Auto-watch enabled for {canonical_path} -> {entity_id} (watch_id={watch.watch_id})"
+        )
+
+    return watch.watch_id
+
+
 def _sanitize_path_for_error(path: str) -> str:
     """
     Sanitize a path for inclusion in error messages.
@@ -239,6 +273,21 @@ async def sync_directory(
 
     entity_id = get_user_id(request, body.entity_id)
     executor = request.app.state.thread_pool
+
+    # Ensure any synced directory is also watched for future automatic re-indexing.
+    try:
+        manager = DirectoryWatchManager()
+        await ensure_directory_watch(
+            canonical_path=canonical_path,
+            entity_id=entity_id,
+            manager=manager,
+            recursive=body.recursive,
+            file_extensions=body.file_extensions,
+            ignore_patterns=body.ignore_patterns,
+            debounce_seconds=10,
+        )
+    except Exception as e:
+        logger.error(f"Failed to auto-enable watch for {canonical_path}: {e}")
 
     # Discover current files
     try:
