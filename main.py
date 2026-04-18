@@ -24,10 +24,12 @@ from app.config import (
     WATCH_DIRECTORIES,
     LogMiddleware,
     logger,
+    vector_store,
 )
 from app.middleware import security_middleware
 from app.routes import document_routes, pgvector_routes, directory_routes
 from app.services.database import PSQLDatabase, ensure_vector_indexes
+from app.services.vector_store.factory import close_vector_store_connections
 from app.services.directory_service import (
     ensure_directory_tables,
     get_all_enabled_watches,
@@ -52,7 +54,6 @@ async def handle_file_changes(
     for change in changes:
         try:
             if change.event_type == "deleted":
-                # Handle deletion
                 await sync_single_file(
                     filepath=change.filepath,
                     entity_id=watch.entity_id,
@@ -60,7 +61,6 @@ async def handle_file_changes(
                     delete_if_missing=True,
                 )
             else:
-                # Handle create/modify
                 await sync_single_file(
                     filepath=change.filepath,
                     entity_id=watch.entity_id,
@@ -70,7 +70,6 @@ async def handle_file_changes(
         except Exception as e:
             logger.error(f"Failed to process change for {change.filepath}: {e}")
 
-    # Update last sync timestamp
     await update_watch_last_sync(watch.watch_id)
 
 
@@ -171,9 +170,23 @@ async def lifespan(app: FastAPI):
         logger.info("Stopping directory watch manager")
         watch_manager.stop()
 
+    if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
+        try:
+            logger.info("Closing asyncpg connection pool")
+            await PSQLDatabase.close_pool()
+            logger.info("asyncpg connection pool closed")
+        except Exception as e:
+            logger.warning("Failed to close asyncpg pool: %s", e)
+
     logger.info("Shutting down thread pool")
     app.state.thread_pool.shutdown(wait=True)
     logger.info("Thread pool shutdown complete")
+
+    # Close vector store connections (MongoDB client / SQLAlchemy engine)
+    try:
+        close_vector_store_connections(vector_store)
+    except Exception as e:
+        logger.warning("Failed to close vector store connections: %s", e)
 
 
 app = FastAPI(lifespan=lifespan, debug=debug_mode)
@@ -204,17 +217,10 @@ if debug_mode:
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    body = await request.body()
-    logger.debug(f"Validation error occurred")
-    logger.debug(f"Raw request body: {body.decode()}")
-    logger.debug(f"Validation errors: {exc.errors()}")
+    logger.debug("Validation error: %s", exc.errors())
     return JSONResponse(
         status_code=422,
-        content={
-            "detail": exc.errors(),
-            "body": body.decode(),
-            "message": "Request validation failed",
-        },
+        content={"detail": exc.errors(), "message": "Request validation failed"},
     )
 
 
